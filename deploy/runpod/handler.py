@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RunPod Serverless worker for MTVanityKey.
+"""RunPod Serverless worker for MeshVanityKey.
 
 On start: pick the CUDA build that matches GPU 0 (the highest of sm_86,
 sm_89 and sm_120 at or below its compute capability; each binary also
@@ -22,7 +22,7 @@ turned down to warnings unless RUNPOD_LOG_LEVEL says otherwise.
 
 Environment: MTVK_BIN_DIR (directory of mtvanitykey-sm_*; default
 /opt/mtvanitykey/bin), MTVK_BINARY (use this binary instead), MTVK_PORT
-(default 8080).
+(default 8080), and the job limits below (MTVK_MAX_*, MTVK_JOB_TIMEOUT).
 """
 
 import time
@@ -35,6 +35,7 @@ import json  # noqa: E402
 import os  # noqa: E402
 import subprocess  # noqa: E402
 import sys  # noqa: E402
+import threading  # noqa: E402
 import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
@@ -58,13 +59,44 @@ BASE = f"http://127.0.0.1:{PORT}"
 POLL_SECONDS = 0.05
 PROGRESS_SECONDS = 0.25
 READY_TIMEOUT = 180.0
-# Local server limits: the DESIGN limits (8 digits, 8 prefix characters,
-# 1-4 hits); one job at a time per worker.
+# Job limits, configurable per endpoint through environment variables
+# (defaults in parentheses): MTVK_MAX_PREFIX_CHARS (9), MTVK_MAX_DIGITS (8),
+# MTVK_MAX_HITS (4), MTVK_MAX_EXPECTED_SECONDS (600; jobs expected to take
+# longer at the measured rate are refused), MTVK_JOB_TIMEOUT (300 s) and
+# MTVK_ASSUMED_RATE (5e9 keys/s: the rate the time limit uses until the
+# first job has measured the real one; the server skips calibration to
+# start fast, and a CPU-scale guess would refuse long GPU jobs).
+# Keep the endpoint's own execution timeout above the job timeout.
+LIMITS = {
+    "--max-prefix-chars": os.environ.get("MTVK_MAX_PREFIX_CHARS", "9"),
+    "--max-digits": os.environ.get("MTVK_MAX_DIGITS", "8"),
+    "--max-hits": os.environ.get("MTVK_MAX_HITS", "4"),
+    "--max-expected-seconds": os.environ.get("MTVK_MAX_EXPECTED_SECONDS", "600"),
+    "--job-timeout": os.environ.get("MTVK_JOB_TIMEOUT", "300"),
+    "--assumed-rate": os.environ.get("MTVK_ASSUMED_RATE", "5e9"),
+}
+# MTVK_REFRESH_WORKER (0): ask RunPod to reset the worker after every job.
+# Off by default: RunPod answers the reset by starting a fresh container on
+# that worker a minute or so later, which idles (and is billed) before it
+# stops. A short endpoint idle timeout stops workers sooner and cheaper.
+REFRESH_WORKER = os.environ.get("MTVK_REFRESH_WORKER", "0") == "1"
+
+# Fanned-out searches (several jobs for one request, the first key wins):
+# a job may carry a `group_url` under MTVK_GROUP_URL_PREFIX (unset: the
+# feature is off and the field is ignored). While searching, the handler
+# polls it every GROUP_POLL_SECONDS; once it answers {"done": true} the job
+# ends normally without keys ({"superseded": true}). Ending normally, rather
+# than being cancelled by RunPod, lets refresh_worker stop the worker
+# cleanly: a cancelled job's result is rejected and the worker then exits
+# in a way RunPod treats as a failure (restarts and retries, billed).
+GROUP_URL_PREFIX = os.environ.get("MTVK_GROUP_URL_PREFIX", "")
+GROUP_POLL_SECONDS = 2.0
+
+# One job at a time per worker.
 SERVE_ARGS = [
     "--gpu-only", "--quiet", "--calibrate", "0",
-    "--max-hits", "4", "--max-digits", "8", "--max-prefix-chars", "8",
-    "--max-queue", "4", "--max-expected-seconds", "600",
-    "--job-timeout", "300", "--result-ttl", "60", "--max-wait", "0",
+    *(arg for pair in LIMITS.items() for arg in pair),
+    "--max-queue", "4", "--result-ttl", "60", "--max-wait", "0",
     "--handler-threads", "4",
 ]
 
@@ -149,6 +181,26 @@ def start_serve(while_starting=None):
     log(f"ready in {time.monotonic() - T0:.2f} s: {gpu_name} (compute {cap[0]}.{cap[1]}, {os.path.basename(binary)})")
 
 
+def group_url(job_input):
+    """The job's group_url if it is allowed (MTVK_GROUP_URL_PREFIX), else None."""
+    url = job_input.get("group_url") if isinstance(job_input, dict) else None
+    if not GROUP_URL_PREFIX or not isinstance(url, str) or len(url) > 512:
+        return None
+    if not url.startswith(GROUP_URL_PREFIX) or any(c.isspace() for c in url):
+        return None
+    return url
+
+
+def group_done(url):
+    """True if the group says the search is over (failures count as not)."""
+    request = urllib.request.Request(url, headers={"User-Agent": "mtvanitykey-runpod"})
+    try:
+        with urllib.request.urlopen(request, timeout=3.0) as response:
+            return json.loads(response.read(4096)).get("done") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def local_path(job_input):
     """Validate the job input; return (local API path, client public key)."""
     if not isinstance(job_input, dict):
@@ -179,18 +231,38 @@ def local_path(job_input):
     return f"/v1/{flow}?{urllib.parse.urlencode(query)}", client
 
 
+# The SDK's progress_update posts from a detached thread, so an update can
+# reach RunPod after the job's result and flip it back to IN_PROGRESS for
+# good. Updates are sent from threads kept here instead, and the handler
+# waits for the last one before it returns the result.
+progress_thread = None
+
+
 def send_progress(job, status):
+    global progress_thread
     # Outside a RunPod worker (local test mode) there is nowhere to send it.
     if runpod is None or not os.environ.get("RUNPOD_WEBHOOK_POST_OUTPUT"):
         return
+    if progress_thread is not None and progress_thread.is_alive():
+        return  # the previous update is still in flight; skip this one
     attempts = status.get("attempts") or 0
-    runpod.serverless.progress_update(job, {
+    progress = {
         "phase": "running" if status.get("status") == "running" and attempts > 0 else "starting",
         "gpu": gpu_name,
         "attempts": attempts,
         "keys_per_second": status.get("keys_per_second") or 0.0,
         "expected_attempts": status.get("expected_attempts") or 0.0,
-    })
+    }
+    from runpod.serverless.modules import rp_progress
+
+    progress_thread = threading.Thread(target=rp_progress._thread_target, args=(job, progress), daemon=True)
+    progress_thread.start()
+
+
+def wait_for_progress():
+    """Let an in-flight progress update land before the result is sent."""
+    if progress_thread is not None:
+        progress_thread.join(timeout=10)
 
 
 async def handler(job):
@@ -213,6 +285,8 @@ async def handler(job):
     local_id = body["id"]
     finished = False
     next_progress = time.monotonic()
+    group = group_url(job.get("input"))
+    next_group = time.monotonic() + GROUP_POLL_SECONDS
     try:
         while True:
             try:
@@ -222,9 +296,23 @@ async def handler(job):
                 return {"error": "the GPU engine is unavailable; retry", "refresh_worker": True}
             if status != 200:
                 finished = True
+                await asyncio.to_thread(wait_for_progress)
                 log("job failed")
                 return {"error": body.get("error", f"HTTP {status}")}
             state = body.get("status")
+            if state in ("queued", "running") and group and time.monotonic() >= next_group:
+                next_group = time.monotonic() + GROUP_POLL_SECONDS
+                if await asyncio.to_thread(group_done, group):
+                    # Another job of this search found the key (or it was
+                    # stopped): end normally, without keys.
+                    try:
+                        http("DELETE", f"/v1/jobs/{local_id}", timeout=2.0)
+                    except OSError:
+                        pass
+                    finished = True
+                    await asyncio.to_thread(wait_for_progress)
+                    log(f"job superseded {time.monotonic() - started:.2f} s {gpu_name}")
+                    return {"v": 1, "superseded": True, "gpu": gpu_name, "attempts": body.get("attempts") or 0}
             if state in ("queued", "running"):
                 if time.monotonic() >= next_progress:
                     send_progress(job, body)
@@ -232,6 +320,7 @@ async def handler(job):
                 await asyncio.sleep(POLL_SECONDS)
                 continue
             finished = True
+            await asyncio.to_thread(wait_for_progress)
             if state != "done":
                 log(f"job {state}")
                 return {"error": body.get("error", state)}
@@ -257,6 +346,7 @@ async def handler(job):
                 pass
 
 
+
 def import_runpod():
     global runpod
     import runpod as sdk
@@ -266,4 +356,4 @@ def import_runpod():
 
 if __name__ == "__main__":
     start_serve(while_starting=import_runpod)
-    runpod.serverless.start({"handler": handler})
+    runpod.serverless.start({"handler": handler, "refresh_worker": REFRESH_WORKER})

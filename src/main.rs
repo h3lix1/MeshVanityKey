@@ -122,7 +122,7 @@ struct MeshtasticArgs {
 
 #[derive(ClapArgs, Debug)]
 struct MeshcoreArgs {
-    /// Public-key hex prefix, 1 to 8 characters (case-insensitive; prefixes
+    /// Public-key hex prefix, 1 to 64 characters (case-insensitive; prefixes
     /// starting 00 or FF are reserved by MeshCore). Every character
     /// multiplies the expected search by 16.
     prefix: String,
@@ -165,8 +165,9 @@ struct ServeArgs {
     #[arg(long, default_value_t = 8, value_name = "N")]
     max_digits: u32,
 
-    /// Longest MeshCore prefix accepted, in hex characters (at most 8).
-    #[arg(long, default_value_t = 8, value_name = "N")]
+    /// Longest MeshCore prefix accepted, in hex characters (1 to 64; the
+    /// default 64 leaves only the --max-expected-seconds limit).
+    #[arg(long, default_value_t = mtvanitykey::prefix::MAX_PREFIX_CHARS, value_name = "N")]
     max_prefix_chars: usize,
 
     /// Stop (and fail) a running job after this many seconds.
@@ -184,6 +185,12 @@ struct ServeArgs {
     /// Seconds spent measuring the key rate at startup (0 skips it).
     #[arg(long, default_value_t = 2.0, value_name = "SECS")]
     calibrate: f64,
+
+    /// Keys/s assumed for the time limit and ETAs until a rate has been
+    /// measured (by --calibrate or a finished job). With --calibrate 0 set
+    /// it near the device's real rate, or long jobs are refused at first.
+    #[arg(long, default_value_t = 1e8, value_name = "KEYS_PER_SEC")]
+    assumed_rate: f64,
 
     /// HTTP handler threads (each waiting request occupies one).
     #[arg(long, default_value_t = 8, value_name = "N")]
@@ -359,9 +366,9 @@ fn run_search(request: Request, search: &SearchOptions, run: &RunOptions) -> Res
 }
 
 fn serve(args: ServeArgs) -> Result<()> {
-    if args.max_prefix_chars > mtvanitykey::prefix::MAX_PREFIX_CHARS {
+    if !(1..=mtvanitykey::prefix::MAX_PREFIX_CHARS).contains(&args.max_prefix_chars) {
         return Err(anyhow!(
-            "--max-prefix-chars may be at most {}",
+            "--max-prefix-chars must be 1 to {}",
             mtvanitykey::prefix::MAX_PREFIX_CHARS
         ));
     }
@@ -384,6 +391,10 @@ fn serve(args: ServeArgs) -> Result<()> {
     config.result_ttl = Duration::from_secs(args.result_ttl.max(1));
     config.max_wait = Duration::from_secs(args.max_wait);
     config.calibrate = Duration::from_secs_f64(args.calibrate.max(0.0));
+    if !(args.assumed_rate.is_finite() && args.assumed_rate > 0.0) {
+        return Err(anyhow!("--assumed-rate must be a positive number of keys per second"));
+    }
+    config.fallback_rate = args.assumed_rate;
     config.handler_threads = args.handler_threads.max(1);
     config.log = !args.quiet;
     let has_token = config.token.is_some();
@@ -449,7 +460,7 @@ mod tests {
     fn serve_subcommand_parses_limits() {
         let cli = Cli::try_parse_from([
             "mtvanitykey", "serve", "--bind", "0.0.0.0:9000", "--token", "secret", "--max-queue", "4",
-            "--max-expected-seconds", "30", "--calibrate", "0",
+            "--max-expected-seconds", "30", "--calibrate", "0", "--assumed-rate", "5e9",
         ])
         .unwrap();
         match cli.command {
@@ -459,6 +470,7 @@ mod tests {
                 assert_eq!(s.max_queue, 4);
                 assert_eq!(s.max_expected_seconds, 30.0);
                 assert_eq!(s.calibrate, 0.0);
+                assert_eq!(s.assumed_rate, 5e9);
             }
             other => panic!("unexpected {other:?}"),
         }
